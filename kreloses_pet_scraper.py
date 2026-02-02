@@ -24,8 +24,12 @@ DEFAULT_PASSWORD_HASH = os.getenv("DEFAULT_PASSWORD_HASH")
 # File configuration
 PETS_OUTPUT_FILE = os.getenv("PETS_OUTPUT_FILE", "pets.csv")
 CUSTOMERS_OUTPUT_FILE = os.getenv("CUSTOMERS_OUTPUT_FILE", "customers.csv")
+MEDICAL_RECORDS_OUTPUT_FILE = os.getenv("MEDICAL_RECORDS_OUTPUT_FILE", "medical_records.csv")
+MEDICAL_RECORD_ENTRIES_OUTPUT_FILE = os.getenv("MEDICAL_RECORD_ENTRIES_OUTPUT_FILE", "medical_record_entries.csv")
 PROGRESS_FILE = os.getenv("PROGRESS_FILE", "scraper_progress.txt")
 CUSTOMER_ID_START = int(os.getenv("CUSTOMER_ID_START", "100"))
+PET_ID_START = int(os.getenv("PET_ID_START", "100"))
+MEDICAL_RECORD_ID_START = int(os.getenv("MEDICAL_RECORD_ID_START", "100"))
 
 
 async def _extract_pet_fields_from_card(card):
@@ -250,7 +254,198 @@ def _is_invalid_email(email):
     # Check if it looks like a valid email (has @ and .)
     if '@' not in email_clean or '.' not in email_clean:
         return True
+    # Check for invalid characters (semicolons, spaces, etc.)
+    if re.search(r'[;,\s<>()\[\]]', email_clean):
+        return True
+    # Basic format check: local@domain.tld
+    email_match = re.match(r'^[^@]+@[^@]+\.[^@]+$', email_clean)
+    if not email_match:
+        return True
+    # Check domain has valid format (no semicolons, at least 2 chars after last dot)
+    domain = email_clean.split('@')[1]
+    if not re.match(r'^[a-z0-9.-]+\.[a-z]{2,}$', domain):
+        return True
     return False
+
+
+def _clean_html_content(html_content):
+    """Clean HTML content by removing style/class attributes but keeping tags.
+    
+    Wraps content in <html> tags.
+    """
+    if not html_content:
+        return ''
+    
+    # Remove style attributes
+    html_content = re.sub(r'\s*style="[^"]*"', '', html_content)
+    # Remove class attributes
+    html_content = re.sub(r'\s*class="[^"]*"', '', html_content)
+    # Remove data-* attributes
+    html_content = re.sub(r'\s*data-[a-z-]+="[^"]*"', '', html_content)
+    # Remove id attributes
+    html_content = re.sub(r'\s*id="[^"]*"', '', html_content)
+    # Remove border attributes from tables
+    html_content = re.sub(r'\s*border="[^"]*"', '', html_content)
+    # Clean up empty attribute lists
+    html_content = re.sub(r'<(\w+)\s+>', r'<\1>', html_content)
+    # Remove &nbsp; and replace with space
+    html_content = html_content.replace('&nbsp;', ' ')
+    # Clean up multiple spaces
+    html_content = re.sub(r' +', ' ', html_content)
+    
+    # Wrap in <html> tags
+    return f'<html>{html_content.strip()}</html>'
+
+
+def _parse_record_date(date_str):
+    """Parse date string like 'Wednesday, 21 January 2026' to 'YYYY-MM-DD'."""
+    if not date_str:
+        return ''
+    
+    # Remove day name if present (e.g., "Wednesday, ")
+    date_str = re.sub(r'^[A-Za-z]+,\s*', '', date_str.strip())
+    
+    # Try to parse "21 January 2026" format
+    try:
+        dt = datetime.strptime(date_str, '%d %B %Y')
+        return dt.strftime('%Y-%m-%d')
+    except ValueError:
+        pass
+    
+    # Try "January 21, 2026" format
+    try:
+        dt = datetime.strptime(date_str, '%B %d, %Y')
+        return dt.strftime('%Y-%m-%d')
+    except ValueError:
+        pass
+    
+    return ''
+
+
+async def extract_medical_records(page, pets_list):
+    """Extract medical records from the Notes tab.
+    
+    Returns: (medical_records, medical_record_entries)
+    - medical_records: list of {pet_id, created_by, record_date}
+    - medical_record_entries: list of {medical_record_id, entry_type, title, description, created_by}
+    """
+    medical_records = []
+    medical_record_entries = []
+    
+    try:
+        # Click on Notes tab
+        notes_tab = page.get_by_role("tab", name="Notes")
+        if await notes_tab.count() == 0:
+            return medical_records
+        
+        await notes_tab.click()
+        await asyncio.sleep(0.5)  # Wait for notes to load
+        
+        # Click on "All Notes" tab if available
+        all_notes_tab = page.get_by_role("tab", name="All Notes")
+        if await all_notes_tab.count() > 0:
+            await all_notes_tab.click()
+            await asyncio.sleep(0.3)
+        
+        # Extract notes data using JavaScript
+        notes_data = await page.evaluate("""
+            () => {
+                const results = [];
+                const journalList = document.querySelector('.journal-list');
+                if (!journalList) return results;
+                
+                // Find all booking headers
+                const bookings = journalList.querySelectorAll('.journal-booking');
+                
+                bookings.forEach((booking, idx) => {
+                    const bookingText = booking.querySelector('span:first-child')?.textContent?.replace('⏺ ', '').trim() || '';
+                    const bookingDateEl = booking.querySelector('.journal-booking-date');
+                    const bookingDate = bookingDateEl?.textContent?.replace(' - ', '').trim() || '';
+                    
+                    // Find the journal-day (note creation date)
+                    let journalDay = '';
+                    let sibling = booking.nextElementSibling;
+                    while (sibling) {
+                        if (sibling.classList.contains('journal-day')) {
+                            journalDay = sibling.textContent.trim();
+                            break;
+                        }
+                        if (sibling.classList.contains('journal-booking')) break;
+                        sibling = sibling.nextElementSibling;
+                    }
+                    
+                    // Find all journal entries under this booking
+                    const entries = [];
+                    sibling = booking.nextElementSibling;
+                    while (sibling) {
+                        if (sibling.classList.contains('journal-booking')) break;
+                        if (sibling.classList.contains('journal-entry')) {
+                            const noteBody = sibling.querySelector('.tinymceNoteView, [data-hook="body-text"]');
+                            const petNameEl = sibling.querySelector('[class*="person_outline"]')?.parentElement;
+                            let petName = '';
+                            if (petNameEl) {
+                                petName = petNameEl.textContent.replace('person_outline', '').trim();
+                            }
+                            
+                            entries.push({
+                                petName: petName,
+                                htmlContent: noteBody?.innerHTML || ''
+                            });
+                        }
+                        sibling = sibling.nextElementSibling;
+                    }
+                    
+                    // Parse pet name and title from booking text
+                    // Format: "PETNAME, Service1, Service2"
+                    const parts = bookingText.split(',').map(p => p.trim());
+                    const petNameFromBooking = parts[0] || '';
+                    const title = parts.slice(1).join(', ') || '';
+                    
+                    results.push({
+                        bookingText,
+                        petNameFromBooking,
+                        title,
+                        journalDay,
+                        entries
+                    });
+                });
+                
+                return results;
+            }
+        """)
+        
+        # Build a map of pet names to pet IDs
+        pet_name_to_id = {}
+        for pet in pets_list:
+            pet_name = pet.get('pet_name', '').upper()
+            if pet_name:
+                pet_name_to_id[pet_name] = pet.get('user_id')  # This will be updated later
+        
+        # Process notes data
+        for note_data in notes_data:
+            pet_name = note_data.get('petNameFromBooking', '').upper()
+            title = note_data.get('title', '')
+            record_date = _parse_record_date(note_data.get('journalDay', ''))
+            entries = note_data.get('entries', [])
+            
+            if not entries or not pet_name:
+                continue
+            
+            # We'll assign pet_id and medical_record_id later in the main flow
+            for entry in entries:
+                html_content = _clean_html_content(entry.get('htmlContent', ''))
+                if html_content and html_content != '<html></html>':
+                    medical_records.append({
+                        'pet_name': pet_name,  # Will be converted to pet_id later
+                        'record_date': record_date,
+                        'title': title,
+                        'description': html_content
+                    })
+    
+    except Exception as e:
+        print(f"  Warning: Could not extract medical records: {e}")
+    
+    return medical_records
 
 
 def _format_customer_data(name, phone, email, address, customer_id, used_usernames, used_emails, noemail_counter):
@@ -496,6 +691,7 @@ async def extract_pet_data(page, customer_url, customer_id, used_usernames, used
     """Extract pet data from a customer's Sub Accounts tab"""
     pets = []
     customer_data = None
+    raw_medical_records = []
 
     try:
         await page.goto(customer_url, timeout=30000)
@@ -518,7 +714,7 @@ async def extract_pet_data(page, customer_url, customer_id, used_usernames, used
         sub_accounts_tab = page.get_by_role("tab", name="Sub Accounts")
         if await sub_accounts_tab.count() == 0:
             print(f"  No Sub Accounts tab for {customer_url}")
-            return customer_data, pets
+            return customer_data, pets, raw_medical_records
 
         await sub_accounts_tab.click()
         panel = page.get_by_role("tabpanel", name="Sub Accounts")
@@ -538,8 +734,9 @@ async def extract_pet_data(page, customer_url, customer_id, used_usernames, used
                 card_count = alt_count
             else:
                 print(f"  No pets found for {customer_data['first_name']} {customer_data['last_name']}")
-                return customer_data, pets
-                return pets
+                # Still try to extract medical records even if no pets in Sub Accounts
+                raw_medical_records = await extract_medical_records(page, pets)
+                return customer_data, pets, raw_medical_records
 
         # First, expand ALL collapsed cards to load their content
         for i in range(card_count):
@@ -625,20 +822,29 @@ async def extract_pet_data(page, customer_url, customer_id, used_usernames, used
             except Exception as e:
                 print(f"  Error processing pet {i+1}: {e}")
                 continue
+        
+        # Extract medical records from Notes tab
+        raw_medical_records = await extract_medical_records(page, pets)
+        if raw_medical_records:
+            print(f"  Found {len(raw_medical_records)} medical record entries")
 
     except Exception as e:
         print(f"Error extracting pets from {customer_url}: {e}")
 
-    return customer_data, pets
+    return customer_data, pets, raw_medical_records
 
 
 async def scrape_all_data():
     """Main scraping function with incremental saving"""
     all_pets = []
     all_customers = []
+    all_medical_records = []
+    all_medical_record_entries = []
     processed_customer_urls = set()
     failed_customers = []
     next_customer_id = CUSTOMER_ID_START
+    next_pet_id = PET_ID_START
+    next_medical_record_id = MEDICAL_RECORD_ID_START
     
     # Track used usernames and emails for uniqueness
     used_usernames = set()
@@ -657,6 +863,9 @@ async def scrape_all_data():
             with open(PETS_OUTPUT_FILE, 'r', newline='', encoding='utf-8') as csvfile:
                 reader = csv.DictReader(csvfile)
                 all_pets = list(reader)
+            if all_pets:
+                max_pet_id = max(int(p.get('id', PET_ID_START)) for p in all_pets)
+                next_pet_id = max_pet_id + 1
             print(f"Loaded {len(all_pets)} existing pets from {PETS_OUTPUT_FILE}")
         except Exception as e:
             print(f"Warning: Could not load existing pets data: {e}")
@@ -688,10 +897,34 @@ async def scrape_all_data():
         except Exception as e:
             print(f"Warning: Could not load existing customers data: {e}")
     
+    # Load existing medical records if files exist
+    if os.path.exists(MEDICAL_RECORDS_OUTPUT_FILE) and processed_customer_urls:
+        try:
+            with open(MEDICAL_RECORDS_OUTPUT_FILE, 'r', newline='', encoding='utf-8') as csvfile:
+                reader = csv.DictReader(csvfile)
+                all_medical_records = list(reader)
+            if all_medical_records:
+                max_id = max(int(r.get('id', MEDICAL_RECORD_ID_START)) for r in all_medical_records)
+                next_medical_record_id = max_id + 1
+            print(f"Loaded {len(all_medical_records)} existing medical records")
+        except Exception as e:
+            print(f"Warning: Could not load existing medical records: {e}")
+    
+    if os.path.exists(MEDICAL_RECORD_ENTRIES_OUTPUT_FILE) and processed_customer_urls:
+        try:
+            with open(MEDICAL_RECORD_ENTRIES_OUTPUT_FILE, 'r', newline='', encoding='utf-8') as csvfile:
+                reader = csv.DictReader(csvfile)
+                all_medical_record_entries = list(reader)
+            print(f"Loaded {len(all_medical_record_entries)} existing medical record entries")
+        except Exception as e:
+            print(f"Warning: Could not load existing medical record entries: {e}")
+    
     # Track customers processed in current batch (defined here for finally block access)
     pending_urls = []
     pending_customers = []
     pending_pets = []
+    pending_medical_records = []
+    pending_medical_record_entries = []
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=False)  # Set to True for production
@@ -715,15 +948,64 @@ async def scrape_all_data():
                 print(f"Processing customer {i}/{total}: {customer_url}")
                 
                 try:
-                    customer_data, pets = await extract_pet_data(page, customer_url, next_customer_id, used_usernames, used_emails, noemail_counter)
+                    customer_data, pets, raw_medical_records = await extract_pet_data(page, customer_url, next_customer_id, used_usernames, used_emails, noemail_counter)
                     
                     if customer_data:
                         pending_customers.append(customer_data)
                         all_customers.append(customer_data)
                         next_customer_id += 1
                     
+                    # Assign IDs to pets and build name-to-id mapping
+                    pet_name_to_id = {}
+                    for pet in pets:
+                        pet['id'] = next_pet_id
+                        pet_name = pet.get('pet_name', '').upper()
+                        if pet_name:
+                            pet_name_to_id[pet_name] = next_pet_id
+                        next_pet_id += 1
+                    
                     pending_pets.extend(pets)
                     all_pets.extend(pets)
+                    
+                    # Process raw medical records - group by (pet_id, record_date)
+                    # One medical_record per unique (pet_id, record_date), multiple entries can share it
+                    medical_record_map = {}  # (pet_id, record_date) -> medical_record_id
+                    
+                    for raw_record in raw_medical_records:
+                        pet_name = raw_record.get('pet_name', '').upper()
+                        pet_id = pet_name_to_id.get(pet_name, '')
+                        record_date = raw_record.get('record_date', '')
+                        
+                        # Skip if we can't find the pet
+                        if not pet_id:
+                            continue
+                        
+                        # Check if we already have a medical_record for this pet+date
+                        key = (pet_id, record_date)
+                        if key not in medical_record_map:
+                            # Create new medical_record
+                            medical_record = {
+                                'id': next_medical_record_id,
+                                'pet_id': pet_id,
+                                'created_by': 1,
+                                'record_date': record_date
+                            }
+                            medical_record_map[key] = next_medical_record_id
+                            pending_medical_records.append(medical_record)
+                            all_medical_records.append(medical_record)
+                            next_medical_record_id += 1
+                        
+                        # Create medical_record_entry (always, referencing the existing medical_record)
+                        medical_record_entry = {
+                            'medical_record_id': medical_record_map[key],
+                            'entry_type': 'NOTE',
+                            'title': raw_record.get('title', ''),
+                            'description': raw_record.get('description', ''),
+                            'created_by': 1
+                        }
+                        
+                        pending_medical_record_entries.append(medical_record_entry)
+                        all_medical_record_entries.append(medical_record_entry)
                     
                     # Add URL to pending
                     pending_urls.append(customer_url)
@@ -733,16 +1015,20 @@ async def scrape_all_data():
                         # Save CSVs first
                         save_customers_csv(all_customers, CUSTOMERS_OUTPUT_FILE)
                         save_pets_csv(all_pets, PETS_OUTPUT_FILE)
+                        save_medical_records_csv(all_medical_records, MEDICAL_RECORDS_OUTPUT_FILE)
+                        save_medical_record_entries_csv(all_medical_record_entries, MEDICAL_RECORD_ENTRIES_OUTPUT_FILE)
                         
                         # Only THEN mark customers as processed (ensures consistency)
                         processed_customer_urls.update(pending_urls)
                         with open(PROGRESS_FILE, 'w') as f:
                             f.write('\n'.join(processed_customer_urls))
                         
-                        print(f"  Progress saved: {len(all_customers)} customers, {len(all_pets)} pets")
+                        print(f"  Progress saved: {len(all_customers)} customers, {len(all_pets)} pets, {len(all_medical_records)} medical records")
                         pending_urls.clear()
                         pending_customers.clear()
                         pending_pets.clear()
+                        pending_medical_records.clear()
+                        pending_medical_record_entries.clear()
                     
                 except Exception as e:
                     print(f"  Error processing {customer_url}: {e}")
@@ -757,6 +1043,8 @@ async def scrape_all_data():
                 print(f"\n  Saving {len(pending_urls)} pending customers before exit...")
                 save_customers_csv(all_customers, CUSTOMERS_OUTPUT_FILE)
                 save_pets_csv(all_pets, PETS_OUTPUT_FILE)
+                save_medical_records_csv(all_medical_records, MEDICAL_RECORDS_OUTPUT_FILE)
+                save_medical_record_entries_csv(all_medical_record_entries, MEDICAL_RECORD_ENTRIES_OUTPUT_FILE)
                 processed_customer_urls.update(pending_urls)
                 with open(PROGRESS_FILE, 'w') as f:
                     f.write('\n'.join(processed_customer_urls))
@@ -768,6 +1056,10 @@ async def scrape_all_data():
         save_customers_csv(all_customers, CUSTOMERS_OUTPUT_FILE)
     if all_pets:
         save_pets_csv(all_pets, PETS_OUTPUT_FILE)
+    if all_medical_records:
+        save_medical_records_csv(all_medical_records, MEDICAL_RECORDS_OUTPUT_FILE)
+    if all_medical_record_entries:
+        save_medical_record_entries_csv(all_medical_record_entries, MEDICAL_RECORD_ENTRIES_OUTPUT_FILE)
     
     # Clean up progress file on success
     if os.path.exists(PROGRESS_FILE) and not failed_customers:
@@ -781,7 +1073,7 @@ async def scrape_all_data():
         if len(failed_customers) > 10:
             print(f"  ... and {len(failed_customers) - 10} more")
     
-    return all_customers, all_pets
+    return all_customers, all_pets, all_medical_records, all_medical_record_entries
 
 
 def save_pets_csv(pets, filename):
@@ -789,7 +1081,7 @@ def save_pets_csv(pets, filename):
     if not pets:
         return
     
-    fieldnames = ['user_id', 'pet_name', 'species', 'breed', 'spayed', 'birthdate', 'color']
+    fieldnames = ['id', 'user_id', 'pet_name', 'species', 'breed', 'spayed', 'birthdate', 'color']
     
     with open(filename, 'w', newline='', encoding='utf-8-sig') as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
@@ -810,6 +1102,32 @@ def save_customers_csv(customers, filename):
         writer.writerows(customers)
 
 
+def save_medical_records_csv(records, filename):
+    """Save medical records to CSV file with UTF-8 BOM encoding"""
+    if not records:
+        return
+    
+    fieldnames = ['id', 'pet_id', 'created_by', 'record_date']
+    
+    with open(filename, 'w', newline='', encoding='utf-8-sig') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(records)
+
+
+def save_medical_record_entries_csv(entries, filename):
+    """Save medical record entries to CSV file with UTF-8 BOM encoding"""
+    if not entries:
+        return
+    
+    fieldnames = ['medical_record_id', 'entry_type', 'title', 'description', 'created_by']
+    
+    with open(filename, 'w', newline='', encoding='utf-8-sig') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(entries)
+
+
 async def main():
     """Main entry point"""
     print("=" * 60)
@@ -818,11 +1136,11 @@ async def main():
     print(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print()
     
-    customers, pets = await scrape_all_data()
+    customers, pets, medical_records, medical_record_entries = await scrape_all_data()
     
     print()
-    print(f"Total: {len(customers)} customers, {len(pets)} pets")
-    print(f"Output files: {CUSTOMERS_OUTPUT_FILE}, {PETS_OUTPUT_FILE}")
+    print(f"Total: {len(customers)} customers, {len(pets)} pets, {len(medical_records)} medical records, {len(medical_record_entries)} entries")
+    print(f"Output files: {CUSTOMERS_OUTPUT_FILE}, {PETS_OUTPUT_FILE}, {MEDICAL_RECORDS_OUTPUT_FILE}, {MEDICAL_RECORD_ENTRIES_OUTPUT_FILE}")
     print(f"Finished at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 60)
 
