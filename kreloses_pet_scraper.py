@@ -448,7 +448,21 @@ async def extract_medical_records(page, pets_list):
     return medical_records
 
 
-def _format_customer_data(name, phone, email, address, customer_id, used_usernames, used_emails, noemail_counter):
+def _clean_pet_name(pet_name):
+    """Clean pet name by removing parenthetical content and extra whitespace.
+    
+    This ensures consistent pet name matching between Sub Accounts and Notes tabs.
+    """
+    if not pet_name:
+        return ''
+    # Remove parenthetical content like "(Canine)" or "(Dog, Labrador)"
+    cleaned = re.sub(r'\s*\([^)]*\)', '', pet_name)
+    # Normalize whitespace and strip
+    cleaned = ' '.join(cleaned.split()).strip()
+    return cleaned
+
+
+def _format_customer_data(name, phone, email, address, customer_id, kreloses_id, used_usernames, used_emails, noemail_counter):
     """Format customer data from extracted fields."""
     name = (name or '').strip()
     name_parts = name.split() if name else []
@@ -492,6 +506,7 @@ def _format_customer_data(name, phone, email, address, customer_id, used_usernam
     
     return {
         'id': customer_id,
+        'kreloses_id': kreloses_id,
         'first_name': first_name,
         'last_name': last_name,
         'username': username,
@@ -687,7 +702,7 @@ async def extract_customer_info(page):
     return customer_info
 
 
-async def extract_pet_data(page, customer_url, customer_id, used_usernames, used_emails, noemail_counter):
+async def extract_pet_data(page, customer_url, customer_id, kreloses_id, used_usernames, used_emails, noemail_counter):
     """Extract pet data from a customer's Sub Accounts tab"""
     pets = []
     customer_data = None
@@ -705,6 +720,7 @@ async def extract_pet_data(page, customer_url, customer_id, used_usernames, used
             customer_info['email'],
             customer_info['address'],
             customer_id,
+            kreloses_id,
             used_usernames,
             used_emails,
             noemail_counter
@@ -774,6 +790,9 @@ async def extract_pet_data(page, customer_url, customer_id, used_usernames, used
                 # Clean up heading text (remove expand_less/expand_more icons)
                 pet_name = re.sub(r'^expand_(?:less|more)\s*', '', heading_text, flags=re.I)
                 pet_name = re.sub(r'\s+', ' ', pet_name).strip()
+                
+                # Apply consistent pet name cleaning
+                pet_name = _clean_pet_name(pet_name)
 
                 if not pet_name:
                     continue
@@ -851,6 +870,9 @@ async def scrape_all_data():
     used_emails = set()
     noemail_counter = [1]  # Use list to allow modification in nested function
     
+    # Track processed Kreloses IDs to prevent duplicates on resume
+    processed_kreloses_ids = set()
+    
     # Check for existing progress file
     if os.path.exists(PROGRESS_FILE):
         with open(PROGRESS_FILE, 'r') as f:
@@ -893,6 +915,9 @@ async def scrape_all_data():
                                 noemail_counter[0] = max(noemail_counter[0], num + 1)
                             except:
                                 pass
+                    # Track processed Kreloses IDs to prevent duplicates
+                    if c.get('kreloses_id'):
+                        processed_kreloses_ids.add(c['kreloses_id'])
             print(f"Loaded {len(all_customers)} existing customers from {CUSTOMERS_OUTPUT_FILE}")
         except Exception as e:
             print(f"Warning: Could not load existing customers data: {e}")
@@ -945,12 +970,24 @@ async def scrape_all_data():
             # Extract data from each customer
             total = len(remaining_links)
             for i, customer_url in enumerate(remaining_links, 1):
+                # Extract Kreloses customer ID from URL
+                kreloses_id_match = re.search(r'/customer/overview/(\d+)', customer_url.lower())
+                kreloses_id = kreloses_id_match.group(1) if kreloses_id_match else ''
+                
+                # Skip if already processed (prevents duplicates on resume)
+                if kreloses_id and kreloses_id in processed_kreloses_ids:
+                    print(f"Skipping customer {i}/{total}: {customer_url} (already in CSV)")
+                    continue
+                
                 print(f"Processing customer {i}/{total}: {customer_url}")
                 
                 try:
-                    customer_data, pets, raw_medical_records = await extract_pet_data(page, customer_url, next_customer_id, used_usernames, used_emails, noemail_counter)
+                    customer_data, pets, raw_medical_records = await extract_pet_data(page, customer_url, next_customer_id, kreloses_id, used_usernames, used_emails, noemail_counter)
                     
                     if customer_data:
+                        # Track Kreloses ID to prevent duplicates
+                        if kreloses_id:
+                            processed_kreloses_ids.add(kreloses_id)
                         pending_customers.append(customer_data)
                         all_customers.append(customer_data)
                         next_customer_id += 1
@@ -959,7 +996,8 @@ async def scrape_all_data():
                     pet_name_to_id = {}
                     for pet in pets:
                         pet['id'] = next_pet_id
-                        pet_name = pet.get('pet_name', '').upper()
+                        # Use cleaned and uppercased pet name for consistent matching
+                        pet_name = _clean_pet_name(pet.get('pet_name', '')).upper()
                         if pet_name:
                             pet_name_to_id[pet_name] = next_pet_id
                         next_pet_id += 1
@@ -972,7 +1010,8 @@ async def scrape_all_data():
                     medical_record_map = {}  # (pet_id, record_date) -> medical_record_id
                     
                     for raw_record in raw_medical_records:
-                        pet_name = raw_record.get('pet_name', '').upper()
+                        # Apply same cleaning to pet name from Notes tab for consistent matching
+                        pet_name = _clean_pet_name(raw_record.get('pet_name', '')).upper()
                         pet_id = pet_name_to_id.get(pet_name, '')
                         record_date = raw_record.get('record_date', '')
                         
@@ -1094,7 +1133,7 @@ def save_customers_csv(customers, filename):
     if not customers:
         return
     
-    fieldnames = ['id', 'first_name', 'last_name', 'username', 'password', 'role', 'phone', 'additional_phone_1', 'additional_phone_2', 'email', 'street_address']
+    fieldnames = ['id', 'kreloses_id', 'first_name', 'last_name', 'username', 'password', 'role', 'phone', 'additional_phone_1', 'additional_phone_2', 'email', 'street_address']
     
     with open(filename, 'w', newline='', encoding='utf-8-sig') as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
