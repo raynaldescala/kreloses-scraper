@@ -10,7 +10,10 @@ venv/
 
 # Scraper output files
 *.csv
+*.backup
 scraper_progress.txt
+scraper.lock
+docs/
 
 # IDE
 .idea/
