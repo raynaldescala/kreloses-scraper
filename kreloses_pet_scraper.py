@@ -5,8 +5,14 @@ Extracts pet information from the Kreloses clinic management system and exports 
 
 import asyncio
 import csv
+import glob
+import hashlib
+import json
 import os
 import re
+import shutil
+import sys
+import tempfile
 from datetime import datetime
 from playwright.async_api import async_playwright
 from dotenv import load_dotenv
@@ -27,6 +33,7 @@ CUSTOMERS_OUTPUT_FILE = os.getenv("CUSTOMERS_OUTPUT_FILE", "customers.csv")
 MEDICAL_RECORDS_OUTPUT_FILE = os.getenv("MEDICAL_RECORDS_OUTPUT_FILE", "medical_records.csv")
 MEDICAL_RECORD_ENTRIES_OUTPUT_FILE = os.getenv("MEDICAL_RECORD_ENTRIES_OUTPUT_FILE", "medical_record_entries.csv")
 PROGRESS_FILE = os.getenv("PROGRESS_FILE", "scraper_progress.txt")
+LOCK_FILE = os.getenv("LOCK_FILE", "scraper.lock")
 CUSTOMER_ID_START = int(os.getenv("CUSTOMER_ID_START", "100"))
 PET_ID_START = int(os.getenv("PET_ID_START", "100"))
 MEDICAL_RECORD_ID_START = int(os.getenv("MEDICAL_RECORD_ID_START", "100"))
@@ -873,298 +880,926 @@ async def scrape_all_data():
     # Track processed Kreloses IDs to prevent duplicates on resume
     processed_kreloses_ids = set()
     
-    # Check for existing progress file
-    if os.path.exists(PROGRESS_FILE):
-        with open(PROGRESS_FILE, 'r') as f:
-            processed_customer_urls = set(line.strip() for line in f if line.strip())
-        print(f"Resuming from previous session: {len(processed_customer_urls)} customers already processed")
+    # Get working directory for temp file recovery
+    working_dir = os.path.dirname(os.path.abspath(CUSTOMERS_OUTPUT_FILE)) or '.'
     
-    # Load existing data if files exist
-    if os.path.exists(PETS_OUTPUT_FILE) and processed_customer_urls:
-        try:
-            with open(PETS_OUTPUT_FILE, 'r', newline='', encoding='utf-8') as csvfile:
-                reader = csv.DictReader(csvfile)
-                all_pets = list(reader)
-            if all_pets:
-                max_pet_id = max(int(p.get('id', PET_ID_START)) for p in all_pets)
-                next_pet_id = max_pet_id + 1
-            print(f"Loaded {len(all_pets)} existing pets from {PETS_OUTPUT_FILE}")
-        except Exception as e:
-            print(f"Warning: Could not load existing pets data: {e}")
+    # =========================================================================
+    # ACQUIRE LOCK - Prevent concurrent scraper runs
+    # =========================================================================
+    print("Acquiring lock...")
+    lock_acquired, lock_result = _acquire_lock(LOCK_FILE)
+    if not lock_acquired:
+        print(f"  ERROR: {lock_result}")
+        print("  Exiting to prevent data corruption.")
+        return [], [], [], []
+    print(f"  Lock acquired (PID {os.getpid()})")
     
-    if os.path.exists(CUSTOMERS_OUTPUT_FILE) and processed_customer_urls:
-        try:
-            with open(CUSTOMERS_OUTPUT_FILE, 'r', newline='', encoding='utf-8') as csvfile:
-                reader = csv.DictReader(csvfile)
-                all_customers = list(reader)
-            # Get next customer ID and rebuild used usernames/emails from existing data
-            if all_customers:
-                max_id = max(int(c.get('id', CUSTOMER_ID_START)) for c in all_customers)
-                next_customer_id = max_id + 1
-                # Rebuild used sets from existing data
-                for c in all_customers:
-                    if c.get('username'):
-                        used_usernames.add(c['username'])
-                    if c.get('email'):
-                        used_emails.add(c['email'])
-                        # Track noemail counter
-                        email = c['email']
-                        if email.startswith('vpnoemail') and email.endswith('@gmail.com'):
-                            try:
-                                num = int(email.replace('vpnoemail', '').replace('@gmail.com', ''))
-                                noemail_counter[0] = max(noemail_counter[0], num + 1)
-                            except:
-                                pass
-                    # Track processed Kreloses IDs to prevent duplicates
-                    if c.get('kreloses_id'):
-                        processed_kreloses_ids.add(c['kreloses_id'])
-            print(f"Loaded {len(all_customers)} existing customers from {CUSTOMERS_OUTPUT_FILE}")
-        except Exception as e:
-            print(f"Warning: Could not load existing customers data: {e}")
-    
-    # Load existing medical records if files exist
-    if os.path.exists(MEDICAL_RECORDS_OUTPUT_FILE) and processed_customer_urls:
-        try:
-            with open(MEDICAL_RECORDS_OUTPUT_FILE, 'r', newline='', encoding='utf-8') as csvfile:
-                reader = csv.DictReader(csvfile)
-                all_medical_records = list(reader)
-            if all_medical_records:
-                max_id = max(int(r.get('id', MEDICAL_RECORD_ID_START)) for r in all_medical_records)
-                next_medical_record_id = max_id + 1
-            print(f"Loaded {len(all_medical_records)} existing medical records")
-        except Exception as e:
-            print(f"Warning: Could not load existing medical records: {e}")
-    
-    if os.path.exists(MEDICAL_RECORD_ENTRIES_OUTPUT_FILE) and processed_customer_urls:
-        try:
-            with open(MEDICAL_RECORD_ENTRIES_OUTPUT_FILE, 'r', newline='', encoding='utf-8') as csvfile:
-                reader = csv.DictReader(csvfile)
-                all_medical_record_entries = list(reader)
-            print(f"Loaded {len(all_medical_record_entries)} existing medical record entries")
-        except Exception as e:
-            print(f"Warning: Could not load existing medical record entries: {e}")
-    
-    # Track customers processed in current batch (defined here for finally block access)
-    pending_urls = []
-    pending_customers = []
-    pending_pets = []
-    pending_medical_records = []
-    pending_medical_record_entries = []
-    
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False)  # Set to True for production
-        context = await browser.new_context()
-        page = await context.new_page()
+    try:
+        # Check for and clean up orphaned temp files from previous crashes
+        print("Checking for orphaned temp files...")
+        orphaned_temps = _recover_temp_files(working_dir)
+        if orphaned_temps:
+            print(f"  Found {len(orphaned_temps)} orphaned temp files - will attempt recovery")
+        _cleanup_temp_files(working_dir)
         
-        try:
-            # Login
-            await login(page)
+        # =========================================================================
+        # REPAIR CSV FILES - Fix any truncated rows from previous crashes
+        # =========================================================================
+        print("Checking CSV files for corruption...")
+        for csv_file in [CUSTOMERS_OUTPUT_FILE, PETS_OUTPUT_FILE, MEDICAL_RECORDS_OUTPUT_FILE, MEDICAL_RECORD_ENTRIES_OUTPUT_FILE]:
+            if os.path.exists(csv_file):
+                was_repaired, rows_removed, error = _repair_csv_if_needed(csv_file)
+                if was_repaired:
+                    print(f"  Repaired {csv_file}: removed {rows_removed} truncated row(s)")
+                elif error:
+                    print(f"  Warning: Could not check {csv_file}: {error}")
+        
+        # =========================================================================
+        # LOAD PROGRESS FILE WITH MANIFEST
+        # =========================================================================
+        processed_customer_urls, manifest = _load_progress_with_manifest(PROGRESS_FILE)
+        if processed_customer_urls:
+            print(f"Resuming from previous session: {len(processed_customer_urls)} customers already processed")
+            if manifest:
+                print(f"  Last save: {manifest.get('timestamp', 'unknown')}")
+                print(f"  Manifest counts - customers: {manifest.get('customers', '?')}, pets: {manifest.get('pets', '?')}")
+        
+        # Load existing data using safe reader (handles encoding properly)
+        print("Loading existing data...")
+        
+        # Load pets
+        all_pets, pets_error = _read_csv_safe(PETS_OUTPUT_FILE)
+        if pets_error:
+            print(f"  Warning: {pets_error}")
+        elif all_pets:
+            # Fix: ensure 'id' key exists (handle BOM issue)
+            first_row_keys = list(all_pets[0].keys()) if all_pets else []
+            id_key = 'id' if 'id' in first_row_keys else (first_row_keys[0] if first_row_keys else 'id')
+            max_pet_id = max(int(p.get(id_key, p.get('id', PET_ID_START))) for p in all_pets)
+            next_pet_id = max_pet_id + 1
+            print(f"  Loaded {len(all_pets)} existing pets from {PETS_OUTPUT_FILE}")
+        
+        # Load customers
+        all_customers, customers_error = _read_csv_safe(CUSTOMERS_OUTPUT_FILE)
+        if customers_error:
+            print(f"  Warning: {customers_error}")
+        elif all_customers:
+            # Fix: handle potential BOM in first column
+            first_row_keys = list(all_customers[0].keys()) if all_customers else []
+            id_key = 'id' if 'id' in first_row_keys else (first_row_keys[0] if first_row_keys else 'id')
             
-            # Get all customer links
-            customer_links = await get_customer_links(page)
+            max_id = max(int(c.get(id_key, c.get('id', CUSTOMER_ID_START))) for c in all_customers)
+            next_customer_id = max_id + 1
             
-            # Filter out already processed customers
-            remaining_links = [url for url in customer_links if url not in processed_customer_urls]
-            print(f"Remaining customers to process: {len(remaining_links)}")
+            # Rebuild used sets from existing data
+            for c in all_customers:
+                if c.get('username'):
+                    used_usernames.add(c['username'])
+                if c.get('email'):
+                    used_emails.add(c['email'])
+                    # Track noemail counter
+                    email = c['email']
+                    if email.startswith('vpnoemail') and email.endswith('@gmail.com'):
+                        try:
+                            num = int(email.replace('vpnoemail', '').replace('@gmail.com', ''))
+                            noemail_counter[0] = max(noemail_counter[0], num + 1)
+                        except:
+                            pass
+                # Track processed Kreloses IDs to prevent duplicates
+                if c.get('kreloses_id'):
+                    processed_kreloses_ids.add(c['kreloses_id'])
+            print(f"  Loaded {len(all_customers)} existing customers from {CUSTOMERS_OUTPUT_FILE}")
+        
+        # Load medical records
+        all_medical_records, mr_error = _read_csv_safe(MEDICAL_RECORDS_OUTPUT_FILE)
+        if mr_error:
+            print(f"  Warning: {mr_error}")
+        elif all_medical_records:
+            first_row_keys = list(all_medical_records[0].keys()) if all_medical_records else []
+            id_key = 'id' if 'id' in first_row_keys else (first_row_keys[0] if first_row_keys else 'id')
+            max_id = max(int(r.get(id_key, r.get('id', MEDICAL_RECORD_ID_START))) for r in all_medical_records)
+            next_medical_record_id = max_id + 1
+            print(f"  Loaded {len(all_medical_records)} existing medical records")
+        
+        # Load medical record entries
+        all_medical_record_entries, mre_error = _read_csv_safe(MEDICAL_RECORD_ENTRIES_OUTPUT_FILE)
+        if mre_error:
+            print(f"  Warning: {mre_error}")
+        elif all_medical_record_entries:
+            print(f"  Loaded {len(all_medical_record_entries)} existing medical record entries")
+        
+        # CRITICAL: Validate consistency between progress file and actual data
+        # Use CSV data (kreloses_ids) as the source of truth, NOT progress file
+        if processed_customer_urls and not all_customers:
+            print()
+            print("  " + "=" * 56)
+            print("  WARNING: Data inconsistency detected!")
+            print(f"  Progress file says {len(processed_customer_urls)} URLs processed,")
+            print(f"  but customers.csv has 0 customers.")
+            print()
+            print("  This likely means data was lost due to interruption.")
+            print("  Options:")
+            print("    1. Check for backup file: customers.csv.backup")
+            print("    2. Re-scrape from scratch (delete scraper_progress.txt)")
+            print("  " + "=" * 56)
+            print()
             
-            # Extract data from each customer
-            total = len(remaining_links)
-            for i, customer_url in enumerate(remaining_links, 1):
-                # Extract Kreloses customer ID from URL
-                kreloses_id_match = re.search(r'/customer/overview/(\d+)', customer_url.lower())
-                kreloses_id = kreloses_id_match.group(1) if kreloses_id_match else ''
-                
-                # Skip if already processed (prevents duplicates on resume)
-                if kreloses_id and kreloses_id in processed_kreloses_ids:
-                    print(f"Skipping customer {i}/{total}: {customer_url} (already in CSV)")
-                    continue
-                
-                print(f"Processing customer {i}/{total}: {customer_url}")
-                
-                try:
-                    customer_data, pets, raw_medical_records = await extract_pet_data(page, customer_url, next_customer_id, kreloses_id, used_usernames, used_emails, noemail_counter)
-                    
-                    if customer_data:
-                        # Track Kreloses ID to prevent duplicates
-                        if kreloses_id:
-                            processed_kreloses_ids.add(kreloses_id)
-                        pending_customers.append(customer_data)
-                        all_customers.append(customer_data)
-                        next_customer_id += 1
-                    
-                    # Assign IDs to pets and build name-to-id mapping
-                    pet_name_to_id = {}
-                    for pet in pets:
-                        pet['id'] = next_pet_id
-                        # Use cleaned and uppercased pet name for consistent matching
-                        pet_name = _clean_pet_name(pet.get('pet_name', '')).upper()
-                        if pet_name:
-                            pet_name_to_id[pet_name] = next_pet_id
-                        next_pet_id += 1
-                    
-                    pending_pets.extend(pets)
-                    all_pets.extend(pets)
-                    
-                    # Process raw medical records - group by (pet_id, record_date)
-                    # One medical_record per unique (pet_id, record_date), multiple entries can share it
-                    medical_record_map = {}  # (pet_id, record_date) -> medical_record_id
-                    
-                    for raw_record in raw_medical_records:
-                        # Apply same cleaning to pet name from Notes tab for consistent matching
-                        pet_name = _clean_pet_name(raw_record.get('pet_name', '')).upper()
-                        pet_id = pet_name_to_id.get(pet_name, '')
-                        record_date = raw_record.get('record_date', '')
+            # Check for backup
+            backup_file = CUSTOMERS_OUTPUT_FILE + '.backup'
+            if os.path.exists(backup_file):
+                backup_customers, _ = _read_csv_safe(backup_file)
+                if backup_customers:
+                    print(f"  Found backup with {len(backup_customers)} customers!")
+                    response = input("  Restore from backup? (y/n): ").strip().lower()
+                    if response == 'y':
+                        all_customers = backup_customers
+                        # Rebuild tracking data from backup
+                        for c in all_customers:
+                            if c.get('username'):
+                                used_usernames.add(c['username'])
+                            if c.get('email'):
+                                used_emails.add(c['email'])
+                            if c.get('kreloses_id'):
+                                processed_kreloses_ids.add(c['kreloses_id'])
                         
-                        # Skip if we can't find the pet
-                        if not pet_id:
-                            continue
+                        first_row_keys = list(all_customers[0].keys()) if all_customers else []
+                        id_key = 'id' if 'id' in first_row_keys else (first_row_keys[0] if first_row_keys else 'id')
+                        max_id = max(int(c.get(id_key, c.get('id', CUSTOMER_ID_START))) for c in all_customers)
+                        next_customer_id = max_id + 1
+                        print(f"  Restored {len(all_customers)} customers from backup.")
+            
+            # If still no customers, offer to reset progress
+            if not all_customers:
+                response = input("  Reset progress and start fresh? (y/n): ").strip().lower()
+                if response == 'y':
+                    processed_customer_urls.clear()
+                    print("  Progress reset. Will re-scrape all customers.")
+                else:
+                    print("  Continuing with inconsistent state (may skip already-processed URLs).")
+        
+        # Also warn if there's a significant mismatch
+        elif processed_customer_urls and all_customers:
+            url_count = len(processed_customer_urls)
+            customer_count = len(all_customers)
+            if customer_count < url_count * 0.8:  # More than 20% missing
+                print()
+                print(f"  Warning: Progress file has {url_count} URLs but only {customer_count} customers in CSV.")
+                print(f"  Some data may have been lost. Using kreloses_ids from CSV as source of truth.")
+                print()
+        
+        # Track customers processed in current batch (defined here for finally block access)
+        pending_urls = []
+        pending_customers = []
+        pending_pets = []
+        pending_medical_records = []
+        pending_medical_record_entries = []
+        
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=False)  # Set to True for production
+            context = await browser.new_context()
+            page = await context.new_page()
+            
+            try:
+                # Login
+                await login(page)
+                
+                # Get all customer links
+                customer_links = await get_customer_links(page)
+                
+                # Filter out already processed customers
+                remaining_links = [url for url in customer_links if url not in processed_customer_urls]
+                print(f"Remaining customers to process: {len(remaining_links)}")
+                
+                # Extract data from each customer
+                total = len(remaining_links)
+                for i, customer_url in enumerate(remaining_links, 1):
+                    # Extract Kreloses customer ID from URL
+                    kreloses_id_match = re.search(r'/customer/overview/(\d+)', customer_url.lower())
+                    kreloses_id = kreloses_id_match.group(1) if kreloses_id_match else ''
+                    
+                    # Skip if already processed (prevents duplicates on resume)
+                    if kreloses_id and kreloses_id in processed_kreloses_ids:
+                        print(f"Skipping customer {i}/{total}: {customer_url} (already in CSV)")
+                        continue
+                    
+                    print(f"Processing customer {i}/{total}: {customer_url}")
+                    
+                    try:
+                        customer_data, pets, raw_medical_records = await extract_pet_data(page, customer_url, next_customer_id, kreloses_id, used_usernames, used_emails, noemail_counter)
                         
-                        # Check if we already have a medical_record for this pet+date
-                        key = (pet_id, record_date)
-                        if key not in medical_record_map:
-                            # Create new medical_record
-                            medical_record = {
-                                'id': next_medical_record_id,
-                                'pet_id': pet_id,
-                                'created_by': 1,
-                                'record_date': record_date
+                        if customer_data:
+                            # Track Kreloses ID to prevent duplicates
+                            if kreloses_id:
+                                processed_kreloses_ids.add(kreloses_id)
+                            pending_customers.append(customer_data)
+                            all_customers.append(customer_data)
+                            next_customer_id += 1
+                        
+                        # Assign IDs to pets and build name-to-id mapping
+                        pet_name_to_id = {}
+                        for pet in pets:
+                            pet['id'] = next_pet_id
+                            # Use cleaned and uppercased pet name for consistent matching
+                            pet_name = _clean_pet_name(pet.get('pet_name', '')).upper()
+                            if pet_name:
+                                pet_name_to_id[pet_name] = next_pet_id
+                            next_pet_id += 1
+                        
+                        pending_pets.extend(pets)
+                        all_pets.extend(pets)
+                        
+                        # Process raw medical records - group by (pet_id, record_date)
+                        # One medical_record per unique (pet_id, record_date), multiple entries can share it
+                        medical_record_map = {}  # (pet_id, record_date) -> medical_record_id
+                        
+                        for raw_record in raw_medical_records:
+                            # Apply same cleaning to pet name from Notes tab for consistent matching
+                            pet_name = _clean_pet_name(raw_record.get('pet_name', '')).upper()
+                            pet_id = pet_name_to_id.get(pet_name, '')
+                            record_date = raw_record.get('record_date', '')
+                            
+                            # Skip if we can't find the pet
+                            if not pet_id:
+                                continue
+                            
+                            # Check if we already have a medical_record for this pet+date
+                            key = (pet_id, record_date)
+                            if key not in medical_record_map:
+                                # Create new medical_record
+                                medical_record = {
+                                    'id': next_medical_record_id,
+                                    'pet_id': pet_id,
+                                    'created_by': 1,
+                                    'record_date': record_date
+                                }
+                                medical_record_map[key] = next_medical_record_id
+                                pending_medical_records.append(medical_record)
+                                all_medical_records.append(medical_record)
+                                next_medical_record_id += 1
+                            
+                            # Create medical_record_entry (always, referencing the existing medical_record)
+                            medical_record_entry = {
+                                'medical_record_id': medical_record_map[key],
+                                'entry_type': 'NOTE',
+                                'title': raw_record.get('title', ''),
+                                'description': raw_record.get('description', ''),
+                                'created_by': 1
                             }
-                            medical_record_map[key] = next_medical_record_id
-                            pending_medical_records.append(medical_record)
-                            all_medical_records.append(medical_record)
-                            next_medical_record_id += 1
+                            
+                            pending_medical_record_entries.append(medical_record_entry)
+                            all_medical_record_entries.append(medical_record_entry)
                         
-                        # Create medical_record_entry (always, referencing the existing medical_record)
-                        medical_record_entry = {
-                            'medical_record_id': medical_record_map[key],
-                            'entry_type': 'NOTE',
-                            'title': raw_record.get('title', ''),
-                            'description': raw_record.get('description', ''),
-                            'created_by': 1
-                        }
+                        # Add URL to pending
+                        pending_urls.append(customer_url)
                         
-                        pending_medical_record_entries.append(medical_record_entry)
-                        all_medical_record_entries.append(medical_record_entry)
+                        # Save progress every 10 customers
+                        if i % 10 == 0 or i == total:
+                            # TWO-PHASE COMMIT: Save all CSVs atomically
+                            row_counts = save_all_csvs_atomic(
+                                all_customers, all_pets, all_medical_records, all_medical_record_entries,
+                                CUSTOMERS_OUTPUT_FILE, PETS_OUTPUT_FILE, 
+                                MEDICAL_RECORDS_OUTPUT_FILE, MEDICAL_RECORD_ENTRIES_OUTPUT_FILE
+                            )
+                            
+                            # Only THEN mark customers as processed (ensures consistency)
+                            processed_customer_urls.update(pending_urls)
+                            _save_progress_with_manifest(PROGRESS_FILE, processed_customer_urls, row_counts)
+                            
+                            print(f"  Progress saved: {len(all_customers)} customers, {len(all_pets)} pets, {len(all_medical_records)} medical records")
+                            pending_urls.clear()
+                            pending_customers.clear()
+                            pending_pets.clear()
+                            pending_medical_records.clear()
+                            pending_medical_record_entries.clear()
+                        
+                    except Exception as e:
+                        print(f"  Error processing {customer_url}: {e}")
+                        failed_customers.append(customer_url)
                     
-                    # Add URL to pending
-                    pending_urls.append(customer_url)
-                    
-                    # Save progress every 10 customers
-                    if i % 10 == 0 or i == total:
-                        # Save CSVs first
-                        save_customers_csv(all_customers, CUSTOMERS_OUTPUT_FILE)
-                        save_pets_csv(all_pets, PETS_OUTPUT_FILE)
-                        save_medical_records_csv(all_medical_records, MEDICAL_RECORDS_OUTPUT_FILE)
-                        save_medical_record_entries_csv(all_medical_record_entries, MEDICAL_RECORD_ENTRIES_OUTPUT_FILE)
-                        
-                        # Only THEN mark customers as processed (ensures consistency)
-                        processed_customer_urls.update(pending_urls)
-                        with open(PROGRESS_FILE, 'w') as f:
-                            f.write('\n'.join(processed_customer_urls))
-                        
-                        print(f"  Progress saved: {len(all_customers)} customers, {len(all_pets)} pets, {len(all_medical_records)} medical records")
-                        pending_urls.clear()
-                        pending_customers.clear()
-                        pending_pets.clear()
-                        pending_medical_records.clear()
-                        pending_medical_record_entries.clear()
-                    
-                except Exception as e:
-                    print(f"  Error processing {customer_url}: {e}")
-                    failed_customers.append(customer_url)
+                    # Small delay to avoid overwhelming the server
+                    await asyncio.sleep(0.5)
                 
-                # Small delay to avoid overwhelming the server
-                await asyncio.sleep(0.5)
+            finally:
+                # Save any pending work before closing (handles Ctrl+C or errors)
+                if pending_urls:
+                    print(f"\n  Saving {len(pending_urls)} pending customers before exit...")
+                    try:
+                        row_counts = save_all_csvs_atomic(
+                            all_customers, all_pets, all_medical_records, all_medical_record_entries,
+                            CUSTOMERS_OUTPUT_FILE, PETS_OUTPUT_FILE,
+                            MEDICAL_RECORDS_OUTPUT_FILE, MEDICAL_RECORD_ENTRIES_OUTPUT_FILE
+                        )
+                        processed_customer_urls.update(pending_urls)
+                        _save_progress_with_manifest(PROGRESS_FILE, processed_customer_urls, row_counts)
+                    except Exception as e:
+                        print(f"  Warning: Failed to save pending work: {e}")
+                
+                await browser.close()
+        
+        # Final save with two-phase commit
+        if all_customers or all_pets or all_medical_records or all_medical_record_entries:
+            row_counts = save_all_csvs_atomic(
+                all_customers, all_pets, all_medical_records, all_medical_record_entries,
+                CUSTOMERS_OUTPUT_FILE, PETS_OUTPUT_FILE,
+                MEDICAL_RECORDS_OUTPUT_FILE, MEDICAL_RECORD_ENTRIES_OUTPUT_FILE
+            )
+        
+        # Validate cross-file consistency
+        if all_customers and all_pets:
+            is_consistent, errors = _validate_cross_file_consistency(
+                all_customers, all_pets, all_medical_records, all_medical_record_entries
+            )
+            if not is_consistent:
+                print("\nWarning: Cross-file consistency issues detected:")
+                for err in errors:
+                    print(f"  - {err}")
+        
+        # Clean up progress file on success
+        if os.path.exists(PROGRESS_FILE) and not failed_customers:
+            os.remove(PROGRESS_FILE)
+        
+        # Report failed customers
+        if failed_customers:
+            print(f"\nWarning: {len(failed_customers)} customers failed to process:")
+            for url in failed_customers[:10]:  # Show first 10
+                print(f"  - {url}")
+            if len(failed_customers) > 10:
+                print(f"  ... and {len(failed_customers) - 10} more")
+        
+        return all_customers, all_pets, all_medical_records, all_medical_record_entries
+    
+    finally:
+        # ALWAYS release the lock
+        _release_lock(LOCK_FILE)
+
+
+def _recover_temp_files(target_dir):
+    """Check for orphaned temp files and recover if they contain valid data.
+    
+    Returns dict of recovered files: {original_filename: recovered_data}
+    """
+    recovered = {}
+    temp_pattern = os.path.join(target_dir, '*.csv.tmp')
+    
+    for temp_path in glob.glob(temp_pattern):
+        try:
+            # Try to read the temp file
+            with open(temp_path, 'r', newline='', encoding='utf-8-sig') as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
             
-        finally:
-            # Save any pending work before closing (handles Ctrl+C or errors)
-            if pending_urls:
-                print(f"\n  Saving {len(pending_urls)} pending customers before exit...")
-                save_customers_csv(all_customers, CUSTOMERS_OUTPUT_FILE)
-                save_pets_csv(all_pets, PETS_OUTPUT_FILE)
-                save_medical_records_csv(all_medical_records, MEDICAL_RECORDS_OUTPUT_FILE)
-                save_medical_record_entries_csv(all_medical_record_entries, MEDICAL_RECORD_ENTRIES_OUTPUT_FILE)
-                processed_customer_urls.update(pending_urls)
-                with open(PROGRESS_FILE, 'w') as f:
-                    f.write('\n'.join(processed_customer_urls))
+            if rows:
+                # Infer original filename from temp file name
+                # e.g., tmpXXXX.csv.tmp -> check which CSV it might belong to
+                print(f"  Found orphaned temp file with {len(rows)} rows: {temp_path}")
+                recovered[temp_path] = rows
+        except Exception as e:
+            print(f"  Warning: Could not read temp file {temp_path}: {e}")
+        
+    return recovered
+
+
+def _cleanup_temp_files(target_dir):
+    """Remove any orphaned temp files."""
+    temp_pattern = os.path.join(target_dir, '*.csv.tmp')
+    for temp_path in glob.glob(temp_pattern):
+        try:
+            os.unlink(temp_path)
+            print(f"  Cleaned up temp file: {temp_path}")
+        except:
+            pass
+
+
+# =============================================================================
+# FILE LOCKING - Prevent concurrent scraper runs
+# =============================================================================
+
+def _acquire_lock(lock_file):
+    """Acquire an exclusive lock to prevent concurrent scraper runs.
+    
+    Returns (success, lock_handle_or_error_message).
+    On Windows, uses file creation + PID check.
+    """
+    if os.path.exists(lock_file):
+        # Check if the process that created the lock is still running
+        try:
+            with open(lock_file, 'r') as f:
+                lock_data = json.load(f)
+            old_pid = lock_data.get('pid')
+            if old_pid:
+                # Check if process is still running
+                if _is_process_running(old_pid):
+                    return False, f"Another scraper instance is running (PID {old_pid}). Lock file: {lock_file}"
+                else:
+                    # Stale lock - process no longer running
+                    print(f"  Removing stale lock file (PID {old_pid} no longer running)")
+                    os.unlink(lock_file)
+        except (json.JSONDecodeError, KeyError, OSError):
+            # Corrupted lock file, remove it
+            try:
+                os.unlink(lock_file)
+            except:
+                pass
+    
+    # Create lock file with our PID
+    try:
+        lock_data = {
+            'pid': os.getpid(),
+            'started_at': datetime.now().isoformat(),
+            'command': ' '.join(sys.argv)
+        }
+        with open(lock_file, 'w') as f:
+            json.dump(lock_data, f)
+        return True, lock_file
+    except Exception as e:
+        return False, f"Could not create lock file: {e}"
+
+
+def _release_lock(lock_file):
+    """Release the lock file."""
+    try:
+        if os.path.exists(lock_file):
+            os.unlink(lock_file)
+    except Exception as e:
+        print(f"  Warning: Could not remove lock file {lock_file}: {e}")
+
+
+def _is_process_running(pid):
+    """Check if a process with the given PID is still running."""
+    try:
+        # On Windows, we can use os.kill with signal 0
+        # This doesn't actually kill the process, just checks if it exists
+        if os.name == 'nt':  # Windows
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            SYNCHRONIZE = 0x00100000
+            process = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+            if process:
+                kernel32.CloseHandle(process)
+                return True
+            return False
+        else:  # Unix
+            os.kill(pid, 0)
+            return True
+    except (OSError, PermissionError):
+        return False
+
+
+# =============================================================================
+# PARTIAL ROW DETECTION AND REPAIR
+# =============================================================================
+
+def _repair_csv_if_needed(filepath):
+    """Detect and repair truncated last row in a CSV file.
+    
+    Returns (was_repaired, rows_removed, error_message).
+    If the last line is incomplete (no newline, fewer fields), removes it.
+    """
+    if not os.path.exists(filepath):
+        return False, 0, None
+    
+    try:
+        # Read raw bytes to check for incomplete last line
+        with open(filepath, 'rb') as f:
+            content = f.read()
+        
+        if not content:
+            return False, 0, None
+        
+        # Check if file ends with newline
+        ends_with_newline = content.endswith(b'\n') or content.endswith(b'\r\n')
+        
+        if ends_with_newline:
+            # File properly terminated, but still check for field count issues
+            pass
+        
+        # Try to parse and validate
+        rows_before = 0
+        valid_rows = []
+        fieldnames = None
+        
+        with open(filepath, 'r', newline='', encoding='utf-8-sig') as f:
+            reader = csv.reader(f)
+            try:
+                header = next(reader)
+                fieldnames = header
+                expected_field_count = len(header)
+                
+                for row in reader:
+                    rows_before += 1
+                    # Check if row has correct number of fields
+                    if len(row) == expected_field_count:
+                        valid_rows.append(row)
+                    elif len(row) < expected_field_count and rows_before == sum(1 for _ in open(filepath)) - 1:
+                        # Last row with fewer fields - likely truncated
+                        print(f"  Detected truncated last row in {filepath}: {row}")
+                        continue  # Skip this row
+                    else:
+                        valid_rows.append(row)  # Keep rows with extra fields (might be quoted commas)
+            except csv.Error as e:
+                return False, 0, f"CSV parse error: {e}"
+        
+        rows_removed = rows_before - len(valid_rows)
+        
+        if rows_removed > 0:
+            # Rewrite file without the truncated row(s)
+            _create_backup(filepath)
+            with open(filepath, 'w', newline='', encoding='utf-8-sig') as f:
+                writer = csv.writer(f)
+                writer.writerow(fieldnames)
+                writer.writerows(valid_rows)
+            return True, rows_removed, None
+        
+        return False, 0, None
+        
+    except Exception as e:
+        return False, 0, f"Repair check failed: {e}"
+
+
+# =============================================================================
+# CROSS-FILE CONSISTENCY VALIDATION
+# =============================================================================
+
+def _validate_cross_file_consistency(customers, pets, medical_records, medical_record_entries):
+    """Validate referential integrity between CSV data.
+    
+    Returns (is_valid, errors_list).
+    Checks:
+    - All pets reference valid customer IDs
+    - All medical_records reference valid pet IDs
+    - All medical_record_entries reference valid medical_record IDs
+    """
+    errors = []
+    
+    # Build ID sets
+    customer_ids = {c.get('id') or c.get('\ufeffid') for c in customers}
+    pet_ids = {p.get('id') or p.get('\ufeffid') for p in pets}
+    medical_record_ids = {r.get('id') or r.get('\ufeffid') for r in medical_records}
+    
+    # Check pets -> customers (via user_id)
+    for pet in pets:
+        user_id = pet.get('user_id')
+        if user_id and str(user_id) not in {str(cid) for cid in customer_ids}:
+            errors.append(f"Pet {pet.get('id')} references non-existent customer {user_id}")
+    
+    # Check medical_records -> pets
+    for record in medical_records:
+        pet_id = record.get('pet_id')
+        if pet_id and str(pet_id) not in {str(pid) for pid in pet_ids}:
+            errors.append(f"Medical record {record.get('id')} references non-existent pet {pet_id}")
+    
+    # Check medical_record_entries -> medical_records
+    for entry in medical_record_entries:
+        mr_id = entry.get('medical_record_id')
+        if mr_id and str(mr_id) not in {str(rid) for rid in medical_record_ids}:
+            errors.append(f"Medical record entry references non-existent medical_record {mr_id}")
+    
+    # Limit error output
+    if len(errors) > 10:
+        errors = errors[:10] + [f"... and {len(errors) - 10} more errors"]
+    
+    return len(errors) == 0, errors
+
+
+def _create_backup(filename):
+    """Create a backup of the file before overwriting."""
+    if os.path.exists(filename):
+        backup_path = filename + '.backup'
+        try:
+            shutil.copy2(filename, backup_path)
+        except Exception as e:
+            print(f"  Warning: Could not create backup of {filename}: {e}")
+
+
+def _read_csv_safe(filename, encoding='utf-8-sig'):
+    """Safely read a CSV file with proper encoding and error handling.
+    
+    Returns (rows, error_message). If successful, error_message is None.
+    """
+    if not os.path.exists(filename):
+        return [], None
+    
+    try:
+        with open(filename, 'r', newline='', encoding=encoding) as csvfile:
+            reader = csv.DictReader(csvfile)
+            rows = list(reader)
+        return rows, None
+    except Exception as e:
+        # Try fallback encoding
+        try:
+            with open(filename, 'r', newline='', encoding='utf-8') as csvfile:
+                reader = csv.DictReader(csvfile)
+                rows = list(reader)
+            return rows, None
+        except Exception as e2:
+            return [], f"Could not read {filename}: {e2}"
+
+
+def _validate_csv_file(filepath, expected_row_count, fieldnames):
+    """Validate that a CSV file is readable and has expected data.
+    
+    Returns (is_valid, actual_row_count, error_message)
+    """
+    try:
+        with open(filepath, 'r', newline='', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
             
-            await browser.close()
+            # Check row count matches
+            if len(rows) != expected_row_count:
+                return False, len(rows), f"Row count mismatch: expected {expected_row_count}, got {len(rows)}"
+            
+            # Check that all expected fields exist (at least in header)
+            if rows:
+                actual_fields = set(rows[0].keys())
+                expected_fields = set(fieldnames)
+                if not expected_fields.issubset(actual_fields):
+                    missing = expected_fields - actual_fields
+                    return False, len(rows), f"Missing fields: {missing}"
+            
+            return True, len(rows), None
+    except Exception as e:
+        return False, 0, f"Read error: {e}"
+
+
+def _atomic_csv_write(filename, fieldnames, rows):
+    """Atomically write CSV data - prevents data loss on Ctrl+C.
     
-    # Final save
-    if all_customers:
-        save_customers_csv(all_customers, CUSTOMERS_OUTPUT_FILE)
-    if all_pets:
-        save_pets_csv(all_pets, PETS_OUTPUT_FILE)
-    if all_medical_records:
-        save_medical_records_csv(all_medical_records, MEDICAL_RECORDS_OUTPUT_FILE)
-    if all_medical_record_entries:
-        save_medical_record_entries_csv(all_medical_record_entries, MEDICAL_RECORD_ENTRIES_OUTPUT_FILE)
+    Writes to a temp file first, validates it, then replaces the original.
+    If interrupted or validation fails, original stays intact.
+    Also creates a backup before replacing.
+    """
+    if not rows:
+        return
     
-    # Clean up progress file on success
-    if os.path.exists(PROGRESS_FILE) and not failed_customers:
-        os.remove(PROGRESS_FILE)
+    # Get the directory of the target file (temp file must be on same filesystem for atomic rename)
+    target_dir = os.path.dirname(os.path.abspath(filename)) or '.'
     
-    # Report failed customers
-    if failed_customers:
-        print(f"\nWarning: {len(failed_customers)} customers failed to process:")
-        for url in failed_customers[:10]:  # Show first 10
-            print(f"  - {url}")
-        if len(failed_customers) > 10:
-            print(f"  ... and {len(failed_customers) - 10} more")
+    # Create backup of existing file BEFORE any changes
+    _create_backup(filename)
     
-    return all_customers, all_pets, all_medical_records, all_medical_record_entries
+    # Create temp file in same directory with identifiable name
+    base_name = os.path.basename(filename)
+    fd, temp_path = tempfile.mkstemp(suffix=f'.{base_name}.tmp', dir=target_dir)
+    try:
+        with os.fdopen(fd, 'w', newline='', encoding='utf-8-sig') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+            # Force flush to disk
+            csvfile.flush()
+            os.fsync(csvfile.fileno())
+        
+        # CRITICAL: Validate temp file before replacing original
+        is_valid, actual_count, error = _validate_csv_file(temp_path, len(rows), fieldnames)
+        
+        if not is_valid:
+            raise ValueError(f"Temp file validation failed: {error}")
+        
+        # Atomic replace - only happens if validation passed
+        os.replace(temp_path, filename)
+        
+    except Exception as e:
+        # Clean up temp file on any error
+        try:
+            os.unlink(temp_path)
+        except:
+            pass
+        # Re-raise with context
+        raise RuntimeError(f"Failed to save {filename}: {e}. Original file preserved.") from e
+
+
+# =============================================================================
+# ATOMIC TEXT WRITE WITH MANIFEST (for progress file)
+# =============================================================================
+
+def _atomic_text_write(filename, content):
+    """Atomically write text content to a file.
+    
+    Writes to temp file, fsyncs, then atomically replaces original.
+    """
+    target_dir = os.path.dirname(os.path.abspath(filename)) or '.'
+    base_name = os.path.basename(filename)
+    fd, temp_path = tempfile.mkstemp(suffix=f'.{base_name}.tmp', dir=target_dir)
+    
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        
+        # Atomic replace
+        os.replace(temp_path, filename)
+    except Exception as e:
+        try:
+            os.unlink(temp_path)
+        except:
+            pass
+        raise RuntimeError(f"Failed to save {filename}: {e}") from e
+
+
+def _save_progress_with_manifest(progress_file, processed_urls, row_counts):
+    """Save progress file atomically with embedded manifest.
+    
+    The manifest includes timestamp and row counts for consistency verification.
+    Format:
+      # MANIFEST: {"timestamp": "...", "customers": N, "pets": N, ...}
+      url1
+      url2
+      ...
+    """
+    manifest = {
+        'timestamp': datetime.now().isoformat(),
+        'customers': row_counts.get('customers', 0),
+        'pets': row_counts.get('pets', 0),
+        'medical_records': row_counts.get('medical_records', 0),
+        'medical_record_entries': row_counts.get('medical_record_entries', 0),
+        'url_count': len(processed_urls)
+    }
+    
+    lines = [f"# MANIFEST: {json.dumps(manifest)}"]
+    lines.extend(sorted(processed_urls))  # Sort for deterministic output
+    content = '\n'.join(lines)
+    
+    _atomic_text_write(progress_file, content)
+
+
+def _load_progress_with_manifest(progress_file):
+    """Load progress file and extract manifest if present.
+    
+    Returns (processed_urls_set, manifest_dict_or_None).
+    """
+    if not os.path.exists(progress_file):
+        return set(), None
+    
+    try:
+        with open(progress_file, 'r', encoding='utf-8') as f:
+            lines = f.read().strip().split('\n')
+    except Exception:
+        return set(), None
+    
+    manifest = None
+    urls = set()
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith('# MANIFEST:'):
+            try:
+                manifest_json = line[len('# MANIFEST:'):].strip()
+                manifest = json.loads(manifest_json)
+            except json.JSONDecodeError:
+                pass
+        elif not line.startswith('#'):
+            urls.add(line)
+    
+    return urls, manifest
+
+
+# =============================================================================
+# TWO-PHASE COMMIT FOR MULTI-CSV SAVES
+# =============================================================================
+
+def _prepare_csv_temp(filename, fieldnames, rows, target_dir):
+    """Phase 1: Write CSV to temp file and validate.
+    
+    Returns (temp_path, row_count) on success, raises on failure.
+    """
+    if not rows:
+        return None, 0
+    
+    base_name = os.path.basename(filename)
+    fd, temp_path = tempfile.mkstemp(suffix=f'.{base_name}.tmp', dir=target_dir)
+    
+    try:
+        with os.fdopen(fd, 'w', newline='', encoding='utf-8-sig') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+            csvfile.flush()
+            os.fsync(csvfile.fileno())
+        
+        # Validate
+        is_valid, actual_count, error = _validate_csv_file(temp_path, len(rows), fieldnames)
+        if not is_valid:
+            raise ValueError(f"Validation failed for {filename}: {error}")
+        
+        return temp_path, len(rows)
+    except Exception:
+        try:
+            os.unlink(temp_path)
+        except:
+            pass
+        raise
+
+
+def _commit_temps(temp_to_final_map):
+    """Phase 2: Atomically replace all original files with temps.
+    
+    Only called after ALL temps are validated.
+    """
+    for temp_path, final_path in temp_to_final_map.items():
+        if temp_path:  # Skip None entries (empty data)
+            os.replace(temp_path, final_path)
+
+
+def _cleanup_temps(temp_paths):
+    """Clean up temp files on failure."""
+    for temp_path in temp_paths:
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except:
+                pass
+
+
+def save_all_csvs_atomic(customers, pets, medical_records, medical_record_entries,
+                         customers_file, pets_file, medical_records_file, 
+                         medical_record_entries_file):
+    """Two-phase commit: save all CSVs atomically or none.
+    
+    Phase 1: Write all to temp files, validate each
+    Phase 2: Replace all originals with temps (only if Phase 1 succeeds)
+    
+    Returns dict of row counts on success.
+    Raises RuntimeError on failure (all originals preserved).
+    """
+    target_dir = os.path.dirname(os.path.abspath(customers_file)) or '.'
+    
+    # Create backups first
+    for f in [customers_file, pets_file, medical_records_file, medical_record_entries_file]:
+        _create_backup(f)
+    
+    # Field definitions
+    customers_fields = ['id', 'kreloses_id', 'first_name', 'last_name', 'username', 'password', 'role', 'phone', 'additional_phone_1', 'additional_phone_2', 'email', 'street_address']
+    pets_fields = ['id', 'user_id', 'pet_name', 'species', 'breed', 'spayed', 'birthdate', 'color']
+    medical_records_fields = ['id', 'pet_id', 'created_by', 'record_date']
+    medical_record_entries_fields = ['medical_record_id', 'entry_type', 'title', 'description', 'created_by']
+    
+    temp_paths = []
+    temp_to_final = {}
+    row_counts = {}
+    
+    try:
+        # Phase 1: Prepare all temps
+        temp_customers, count = _prepare_csv_temp(customers_file, customers_fields, customers, target_dir)
+        temp_paths.append(temp_customers)
+        if temp_customers:
+            temp_to_final[temp_customers] = customers_file
+        row_counts['customers'] = count
+        
+        temp_pets, count = _prepare_csv_temp(pets_file, pets_fields, pets, target_dir)
+        temp_paths.append(temp_pets)
+        if temp_pets:
+            temp_to_final[temp_pets] = pets_file
+        row_counts['pets'] = count
+        
+        temp_mr, count = _prepare_csv_temp(medical_records_file, medical_records_fields, medical_records, target_dir)
+        temp_paths.append(temp_mr)
+        if temp_mr:
+            temp_to_final[temp_mr] = medical_records_file
+        row_counts['medical_records'] = count
+        
+        temp_mre, count = _prepare_csv_temp(medical_record_entries_file, medical_record_entries_fields, medical_record_entries, target_dir)
+        temp_paths.append(temp_mre)
+        if temp_mre:
+            temp_to_final[temp_mre] = medical_record_entries_file
+        row_counts['medical_record_entries'] = count
+        
+        # Phase 2: Commit all
+        _commit_temps(temp_to_final)
+        
+        return row_counts
+        
+    except Exception as e:
+        # Rollback: clean up any temp files
+        _cleanup_temps(temp_paths)
+        raise RuntimeError(f"Failed to save CSVs (all originals preserved): {e}") from e
 
 
 def save_pets_csv(pets, filename):
-    """Save pet data to CSV file with UTF-8 BOM encoding"""
-    if not pets:
-        return
-    
+    """Save pet data to CSV file with UTF-8 BOM encoding (atomic write)"""
     fieldnames = ['id', 'user_id', 'pet_name', 'species', 'breed', 'spayed', 'birthdate', 'color']
-    
-    with open(filename, 'w', newline='', encoding='utf-8-sig') as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(pets)
+    _atomic_csv_write(filename, fieldnames, pets)
 
 
 def save_customers_csv(customers, filename):
-    """Save customer data to CSV file with UTF-8 BOM encoding"""
-    if not customers:
-        return
-    
+    """Save customer data to CSV file with UTF-8 BOM encoding (atomic write)"""
     fieldnames = ['id', 'kreloses_id', 'first_name', 'last_name', 'username', 'password', 'role', 'phone', 'additional_phone_1', 'additional_phone_2', 'email', 'street_address']
-    
-    with open(filename, 'w', newline='', encoding='utf-8-sig') as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(customers)
+    _atomic_csv_write(filename, fieldnames, customers)
 
 
 def save_medical_records_csv(records, filename):
-    """Save medical records to CSV file with UTF-8 BOM encoding"""
-    if not records:
-        return
-    
+    """Save medical records to CSV file with UTF-8 BOM encoding (atomic write)"""
     fieldnames = ['id', 'pet_id', 'created_by', 'record_date']
-    
-    with open(filename, 'w', newline='', encoding='utf-8-sig') as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(records)
+    _atomic_csv_write(filename, fieldnames, records)
 
 
 def save_medical_record_entries_csv(entries, filename):
-    """Save medical record entries to CSV file with UTF-8 BOM encoding"""
-    if not entries:
-        return
-    
+    """Save medical record entries to CSV file with UTF-8 BOM encoding (atomic write)"""
     fieldnames = ['medical_record_id', 'entry_type', 'title', 'description', 'created_by']
-    
-    with open(filename, 'w', newline='', encoding='utf-8-sig') as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(entries)
+    _atomic_csv_write(filename, fieldnames, entries)
 
 
 async def main():
